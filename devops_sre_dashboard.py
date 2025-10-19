@@ -3,29 +3,146 @@
 import streamlit as st
 import json
 import os
+from urllib.parse import urlparse
 
 st.set_page_config(page_title="DevOps & SRE Journey Dashboard", layout="wide")
 
 # --- Data persistence functions ---
 DATA_FILE = os.path.join(os.path.dirname(__file__), "dashboard_progress.json")
 
+# Remote S3/HTTP location for the progress JSON. By default uses the public
+# S3 HTTPS URL you provided (read-only). You can override with env var
+# DASHBOARD_S3_LOCATION to point to a different location. If you set an
+# s3:// URL and provide AWS credentials (env vars or instance role), the
+# app will attempt to upload when saving.
+S3_LOCATION = os.environ.get("DASHBOARD_S3_LOCATION", "https://nasir473-resume.s3.ap-south-1.amazonaws.com/dev-ops-dashboard/dashboard_progress.json")
+
+# Lazy boto3 client (created only when needed)
+_s3_client = None
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        try:
+            import boto3
+        except Exception:
+            raise
+        _s3_client = boto3.client('s3')
+    return _s3_client
+
+def is_http_url(url: str) -> bool:
+    return url.startswith('http://') or url.startswith('https://')
+
+def is_s3_url(url: str) -> bool:
+    return url.startswith('s3://')
+
+def parse_s3_url(s3_url: str):
+    # returns (bucket, key)
+    if s3_url.startswith('s3://'):
+        without = s3_url[len('s3://'):]
+        parts = without.split('/', 1)
+        bucket = parts[0]
+        key = parts[1] if len(parts) > 1 else ''
+        return bucket, key
+    raise ValueError('Invalid s3 url')
+
 def load_progress():
     """Load progress from local file"""
-    if os.path.exists(DATA_FILE):
+    # If no remote configured, fall back to local (existing behaviour)
+    if not S3_LOCATION:
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                return {}
+        return {}
+
+    # If remote is HTTP(S) - public read
+    if is_http_url(S3_LOCATION):
         try:
-            with open(DATA_FILE, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
+            import requests
+            resp = requests.get(S3_LOCATION, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            # show a warning in the UI but fallback to local file for offline use
+            try:
+                st.warning(f"Could not load remote JSON at {S3_LOCATION}: {e}. Falling back to local file.")
+            except Exception:
+                pass
+            if os.path.exists(DATA_FILE):
+                try:
+                    with open(DATA_FILE, 'r') as f:
+                        return json.load(f)
+                except Exception:
+                    return {}
             return {}
+
+    # If remote is s3:// - use boto3 (requires credentials)
+    if is_s3_url(S3_LOCATION):
+        try:
+            bucket, key = parse_s3_url(S3_LOCATION)
+            s3 = get_s3_client()
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            body = obj['Body'].read().decode('utf-8')
+            return json.loads(body)
+        except Exception as e:
+            try:
+                st.warning(f"Could not load remote S3 JSON {S3_LOCATION}: {e}. Falling back to local file.")
+            except Exception:
+                pass
+            if os.path.exists(DATA_FILE):
+                try:
+                    with open(DATA_FILE, 'r') as f:
+                        return json.load(f)
+                except Exception:
+                    return {}
+            return {}
+
+    # Unknown scheme - fallback
     return {}
 
 def save_progress(data):
     """Save progress to local file"""
+    # Always maintain a local copy as a backup
     try:
         with open(DATA_FILE, 'w') as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        st.error(f"Error saving progress: {e}")
+        try:
+            st.warning(f"Could not write local backup: {e}")
+        except Exception:
+            pass
+
+    # If S3_LOCATION empty - nothing else to do
+    if not S3_LOCATION:
+        return
+
+    # If S3_LOCATION is HTTP(S) (public S3 url) we cannot upload directly
+    if is_http_url(S3_LOCATION):
+        try:
+            st.info("Remote location is HTTP(S) (public). Local copy saved. To enable remote uploads, set DASHBOARD_S3_LOCATION to an s3:// URL and provide AWS credentials.")
+        except Exception:
+            pass
+        return
+
+    # If S3_LOCATION is s3:// we will attempt to upload using boto3
+    if is_s3_url(S3_LOCATION):
+        try:
+            bucket, key = parse_s3_url(S3_LOCATION)
+            s3 = get_s3_client()
+            s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode('utf-8'), ContentType='application/json')
+            try:
+                st.success("Progress saved to S3")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                st.error(f"Failed to save to S3: {e}")
+            except Exception:
+                pass
+        return
 
 # Initialize session state
 if 'progress' not in st.session_state:
